@@ -92,13 +92,15 @@ describe("errorHandler middleware", () => {
 
     expect(status).toHaveBeenCalledWith(409);
     expect(json).toHaveBeenCalledWith({
-      error: "A record with this email already exists",
+      error: "A record with these details already exists",
       code: "CONFLICT",
       requestId: "req-123",
     });
+    expect(JSON.stringify(json.mock.calls)).not.toContain("email");
+    expect(Sentry.captureException).not.toHaveBeenCalled();
   });
 
-  it("falls back to a generic conflict message when Prisma P2002 has no meta.target", () => {
+  it("never exposes Prisma target column names in a P2002 response", () => {
     const { req, res, json, next } = mockReqRes();
     const err = new Prisma.PrismaClientKnownRequestError("Unique constraint failed", {
       code: "P2002",
@@ -108,7 +110,7 @@ describe("errorHandler middleware", () => {
     errorHandler(err, req, res, next);
 
     expect(json).toHaveBeenCalledWith(
-      expect.objectContaining({ error: "A record with this value already exists" })
+      expect.objectContaining({ error: "A record with these details already exists" })
     );
   });
 
@@ -125,7 +127,7 @@ describe("errorHandler middleware", () => {
     expect(json).toHaveBeenCalledWith({ error: "Record not found", code: "NOT_FOUND", requestId: "req-123" });
   });
 
-  it("falls through to a 500 for a Prisma error code with no explicit mapping", () => {
+  it("maps Prisma P2003 foreign-key violations to a safe 409 without reporting to Sentry", () => {
     const { req, res, status, json, next } = mockReqRes();
     const err = new Prisma.PrismaClientKnownRequestError("Some other failure", {
       code: "P2003",
@@ -134,12 +136,47 @@ describe("errorHandler middleware", () => {
 
     errorHandler(err, req, res, next);
 
-    expect(status).toHaveBeenCalledWith(500);
+    expect(status).toHaveBeenCalledWith(409);
     expect(json).toHaveBeenCalledWith({
-      error: "Internal server error",
-      code: "INTERNAL_ERROR",
+      error: "The requested operation conflicts with an existing record",
+      code: "CONFLICT",
       requestId: "req-123",
     });
+    expect(Sentry.captureException).not.toHaveBeenCalled();
+  });
+
+  it("maps Prisma P2000 oversized values to 400 without reporting to Sentry", () => {
+    const { req, res, status, json, next } = mockReqRes();
+    const err = new Prisma.PrismaClientKnownRequestError("Value too long", {
+      code: "P2000", clientVersion: "test", meta: { column_name: "internal_column" },
+    });
+    errorHandler(err, req, res, next);
+    expect(status).toHaveBeenCalledWith(400);
+    expect(json).toHaveBeenCalledWith({
+      error: "One or more submitted values are too long",
+      code: "VALIDATION_ERROR",
+      requestId: "req-123",
+    });
+    expect(JSON.stringify(json.mock.calls)).not.toContain("internal_column");
+    expect(Sentry.captureException).not.toHaveBeenCalled();
+  });
+
+  it("maps Prisma P2034 transaction conflicts to retryable 503 without reporting to Sentry", () => {
+    const { req, res, status, json, next } = mockReqRes();
+    const setHeader = jest.fn();
+    (res as unknown as { setHeader: typeof setHeader }).setHeader = setHeader;
+    const err = new Prisma.PrismaClientKnownRequestError("Transaction conflict", {
+      code: "P2034", clientVersion: "test",
+    });
+    errorHandler(err, req, res, next);
+    expect(setHeader).toHaveBeenCalledWith("Retry-After", "1");
+    expect(status).toHaveBeenCalledWith(503);
+    expect(json).toHaveBeenCalledWith({
+      error: "The operation could not be completed due to temporary contention. Please retry.",
+      code: "SERVICE_UNAVAILABLE",
+      requestId: "req-123",
+    });
+    expect(Sentry.captureException).not.toHaveBeenCalled();
   });
 
   it("maps an unknown/unexpected error to a generic 500, and reports it to Sentry", () => {

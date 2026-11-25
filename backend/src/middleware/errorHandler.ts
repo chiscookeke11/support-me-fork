@@ -79,10 +79,51 @@ export function errorHandler(
 
   if (err instanceof Prisma.PrismaClientKnownRequestError) {
     if (err.code === "P2002") {
+      // Keep database identifiers in server logs only; never expose them in API responses.
+      log("warn", "Prisma unique constraint conflict", {
+        requestId: req.requestId,
+        target: err.meta?.target,
+      });
       return res.status(409).json(
         withRequestId(req, {
-          error: `A record with this ${(err.meta?.target as string[] | undefined)?.join(", ") ?? "value"} already exists`,
+          error: "A record with these details already exists",
           code: "CONFLICT",
+        })
+      );
+    }
+    if (err.code === "P2003") {
+      log("warn", "Prisma foreign key constraint violation", {
+        requestId: req.requestId,
+        fieldName: err.meta?.field_name,
+      });
+      return res.status(409).json(
+        withRequestId(req, {
+          error: "The requested operation conflicts with an existing record",
+          code: "CONFLICT",
+        })
+      );
+    }
+    if (err.code === "P2000") {
+      log("warn", "Prisma value exceeds column length", {
+        requestId: req.requestId,
+        columnName: err.meta?.column_name,
+      });
+      return res.status(400).json(
+        withRequestId(req, {
+          error: "One or more submitted values are too long",
+          code: "VALIDATION_ERROR",
+        })
+      );
+    }
+    if (err.code === "P2034") {
+      log("warn", "Prisma transaction conflict; client may retry", {
+        requestId: req.requestId,
+      });
+      res.setHeader("Retry-After", "1");
+      return res.status(503).json(
+        withRequestId(req, {
+          error: "The operation could not be completed due to temporary contention. Please retry.",
+          code: "SERVICE_UNAVAILABLE",
         })
       );
     }
